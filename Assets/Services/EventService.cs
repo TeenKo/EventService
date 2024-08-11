@@ -79,12 +79,12 @@ namespace Services
 
         public void Dispose()
         {
-            _eventDataProvider.Dispose();
+            _eventDataProvider?.Dispose();
 
             _serviceSource?.Cancel();
             _serviceSource?.Dispose();
             
-            _eventTransport.Dispose();
+            _eventTransport?.Dispose();
         }
     }
 }
