@@ -5,145 +5,86 @@ namespace Services
     using System.Threading;
     using Cysharp.Threading.Tasks;
     using Data;
-    using MemoryPack;
-    using UnityEngine;
-    using UnityEngine.Networking;
-    using Tools;
+    using Provider;
+    using Transport;
 
-    public class EventService : MonoBehaviour, IDisposable
+    [Serializable]
+    public class EventService : IDisposable, IEventService
     {
-        [SerializeField]
-        private string serverUrl;
-        [SerializeField]
-        private float cooldownBeforeSend = 2.0f;
+        private EventServiceData _eventServiceData;
+        private List<EventData> _processedData = new();
 
-        private readonly Queue<EventData> _eventQueue = new();
-        private bool _isSendingEvents;
-        private bool _processingQueue;
-        private string _path;
+        private IEventProvider _eventDataProvider;
+        private IEventTransport _eventTransport;
+
+        private CancellationTokenSource _serviceSource;
         
-        private CancellationTokenSource _timerSource;
-        private CancellationTokenSource _sendWebRequestSource;
+        private UniTask _initialization;
 
-        private void Start()
+        public EventService(IEventProvider eventDataProvider, IEventTransport eventTransport,
+            EventServiceData eventServiceData)
         {
-            _path = ServiceTools.GetFilePath();
-            ServiceTools.LoadEvents(_path, _eventQueue);
-            ProcessQueueAsync().Forget();
+            _serviceSource = new CancellationTokenSource();
+            _eventTransport = eventTransport;
+            _eventDataProvider = eventDataProvider;
+            _eventServiceData = eventServiceData;
+            _initialization = InitializeAsync().AsAsyncUnitUniTask();
         }
-
+        
         public void TrackEvent(EventData eventData)
         {
-            AddElementToQueue(eventData);
+            _eventDataProvider.Push(eventData);
+        }
+
+        private async UniTask InitializeAsync()
+        {
+            var eventsData = await _eventDataProvider.LoadEventsAsync();
             
-            if (!_processingQueue)
-                ProcessQueueAsync().Forget();
+            foreach (var eventData in eventsData)
+                TrackEvent(eventData);
+            SendEventProcessAsync().Forget();
         }
 
-        private void AddElementToQueue(EventData eventData)
+        private async UniTaskVoid SendEventProcessAsync()
         {
-            _eventQueue.Enqueue(eventData);
-        }
-
-        private async UniTaskVoid ProcessQueueAsync()
-        {
-            _processingQueue = true;
+            await _initialization;
             
-            while (_eventQueue.Count > 0)
+            while (!_serviceSource.IsCancellationRequested)
             {
-                await SendEventsAsync();
+                var events = _eventDataProvider.Events;
+
+                if (events.Count <= 0)
+                {
+                    await UniTask.WaitForSeconds(_eventServiceData.cooldownWhenNoEvents,
+                        cancellationToken: _serviceSource.Token);
+                    continue;
+                }
+
+                _processedData.AddRange(events);
                 
-                _timerSource = new CancellationTokenSource();
-                await UniTask.WaitForSeconds(cooldownBeforeSend, cancellationToken: _timerSource.Token);
-            }
-
-            _processingQueue = false;
-        }
-
-        private async UniTask SendEventsAsync()
-        {
-            if (_isSendingEvents || _eventQueue.Count == 0) return;
-
-            _isSendingEvents = true;
-
-            var eventsToSend = new List<EventData>();
-
-            while (_eventQueue.Count > 0)
-            {
-                eventsToSend.Add(_eventQueue.Dequeue());
-            }
-
-            byte[] data;
-
-            try
-            {
-                data = MemoryPackSerializer.Serialize(eventsToSend);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"Failed to serialize events: {ex.Message}");
-                foreach (var eventData in eventsToSend)
+                foreach (var eventData in _processedData)
                 {
-                    _eventQueue.Enqueue(eventData);
+                    var sendResult = await _eventTransport.SendEventsAsync(eventData, _processedData.IndexOf(eventData));
+    
+                    if (sendResult.Success)
+                    {
+                        _eventDataProvider.Delete(sendResult.Index);
+                    }
                 }
-
-                _isSendingEvents = false;
-                return;
-            }
-
-            try
-            {
-                _sendWebRequestSource = new CancellationTokenSource();
-                await SendPostRequestAsync(data);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"Failed to send events: {ex.Message}");
-                foreach (var eventData in eventsToSend)
-                {
-                    AddElementToQueue(eventData);
-                }
-            }
-            finally
-            {
-                _isSendingEvents = false;
                 
-                if (_eventQueue.Count > 0)
-                {
-                    await SendEventsAsync();
-                }
+                await UniTask.WaitForSeconds(_eventServiceData.cooldownBeforeSend,
+                    cancellationToken: _serviceSource.Token);
             }
-        }
-
-        private async UniTask SendPostRequestAsync(byte[] data)
-        {
-            using var request = new UnityWebRequest(serverUrl, ConstContainer.PostMethod);
-            request.uploadHandler = new UploadHandlerRaw(data);
-            request.downloadHandler = new DownloadHandlerBuffer();
-            request.SetRequestHeader(ConstContainer.RequestHeader, ConstContainer.RequestValue);
-
-            _sendWebRequestSource = new CancellationTokenSource();
-            await request.SendWebRequest().WithCancellation(_sendWebRequestSource.Token);
-
-            if (request.result != UnityWebRequest.Result.Success || request.responseCode != 200)
-            {
-                throw new Exception(request.error ?? $"Server returned {request.responseCode}");
-            }
-        }
-
-        private void OnApplicationQuit()
-        {
-            ServiceTools.SaveEvents(_path, _eventQueue);
-            Dispose();
         }
 
         public void Dispose()
         {
-            _sendWebRequestSource?.Cancel();
-            _sendWebRequestSource?.Dispose();
+            _eventDataProvider.Dispose();
+
+            _serviceSource?.Cancel();
+            _serviceSource?.Dispose();
             
-            _timerSource?.Cancel();
-            _timerSource?.Dispose();
+            _eventTransport.Dispose();
         }
     }
 }
